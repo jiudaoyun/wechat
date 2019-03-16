@@ -12,6 +12,8 @@ import (
 	"strings"
 	"io"
 	"crypto/tls"
+	"go.uber.org/zap"
+	"github.com/jiudaoyun/wechat"
 )
 
 const API_URL = "https://api.mch.weixin.qq.com"
@@ -28,6 +30,8 @@ type Client struct {
 
 	client    *http.Client
 	tlsClient *http.Client
+
+	*zap.SugaredLogger
 }
 
 func New(appID, mchID, apiKey string, timeout ...time.Duration) *Client {
@@ -35,6 +39,8 @@ func New(appID, mchID, apiKey string, timeout ...time.Duration) *Client {
 		appID:  appID,
 		mchID:  mchID,
 		apiKey: apiKey,
+
+		SugaredLogger: wechat.Sugar,
 	}
 	if len(timeout) > 0 {
 		client.client = &http.Client{
@@ -51,6 +57,8 @@ func NewWithSubMch(appID, mchID, apiKey, subAppID, subMchID string, timeout ...t
 		apiKey:   apiKey,
 		subAppID: subAppID,
 		subMchID: subMchID,
+
+		SugaredLogger: wechat.Sugar,
 	}
 	if len(timeout) > 0 {
 		client.client = &http.Client{
@@ -113,28 +121,32 @@ func (client *Client) PostXMLWithCert(relativeURL string, req map[string]string)
 }
 
 func (client *Client) postXML(withCert bool, relativeURL string, req map[string]string) (rep map[string]string, err error) {
-	buffer, err := client.makeRequest(req)
+	_, isEnterprisePay := req["mch_appid"]
+
+	buffer, err := client.makeRequest(req, isEnterprisePay)
 	defer pool.Put(buffer)
 	if err != nil {
 		return nil, err
 	}
 
 	url := API_URL + relativeURL
-	rep, err = client.postToMap(withCert, url, buffer)
+	rep, err = client.postToMap(withCert, url, buffer, isEnterprisePay)
 	if err != nil {
 		bizError, ok := err.(*BizError)
-		if !ok || bizError.ErrCode != ErrCodeSYSTEMERROR {
+		if !ok || (bizError.ErrCode != ErrCodeSYSTEMERROR && bizError.ErrCode != ErrCodeBIZERR_NEED_RETRY) {
 			return
 		}
 		url = switchReqURL(url)
-		return client.postToMap(withCert, url, buffer) // retry
+		return client.postToMap(withCert, url, buffer, isEnterprisePay) // retry
 	}
 	return
 }
 
-func (client *Client) makeRequest(req map[string]string) (*bytes.Buffer, error) {
-	req["appid"] = client.appID
-	req["mch_id"] = client.mchID
+func (client *Client) makeRequest(req map[string]string, isEnterprisePay bool) (*bytes.Buffer, error) {
+	if !isEnterprisePay {
+		req["appid"] = client.appID
+		req["mch_id"] = client.mchID
+	}
 	if client.subAppID != "" {
 		req["sub_appid"] = client.subAppID
 	}
@@ -146,12 +158,17 @@ func (client *Client) makeRequest(req map[string]string) (*bytes.Buffer, error) 
 
 	switch client.signType {
 	case "", SignTypeMD5:
-		req["sign_type"] = SignTypeMD5
+		if !isEnterprisePay {
+			req["sign_type"] = SignTypeMD5
+		}
 		req["sign"] = Sign(req, client.apiKey, md5.New())
 	case SignTypeHMAC_SHA256:
-		req["sign_type"] = SignTypeHMAC_SHA256
+		if !isEnterprisePay {
+			req["sign_type"] = SignTypeHMAC_SHA256
+		}
 		req["sign"] = Sign(req, client.apiKey, hmac.New(sha256.New, []byte(client.apiKey)))
 	}
+	fmt.Printf("req: %v\n", req)
 
 	buffer := pool.Get().(*bytes.Buffer)
 	buffer.Reset()
@@ -160,13 +177,13 @@ func (client *Client) makeRequest(req map[string]string) (*bytes.Buffer, error) 
 	return buffer, err
 }
 
-func (client *Client) postToMap(withCert bool, url string, body io.Reader) (rep map[string]string, err error) {
+func (client *Client) postToMap(withCert bool, url string, body io.Reader, isEnterprisePay bool) (rep map[string]string, err error) {
 	repBody, err := client.post(withCert, url, body)
 	if err != nil {
 		return nil, err
 	}
 	defer repBody.Close()
-	return client.toMap(repBody)
+	return client.toMap(repBody, isEnterprisePay)
 }
 
 func (client *Client) post(withCert bool, url string, body io.Reader) (io.ReadCloser, error) {
@@ -185,7 +202,7 @@ func (client *Client) post(withCert bool, url string, body io.Reader) (io.ReadCl
 	return rep.Body, nil
 }
 
-func (client *Client) toMap(repBody io.Reader) (rep map[string]string, err error) {
+func (client *Client) toMap(repBody io.Reader, isEnterprisePay bool) (rep map[string]string, err error) {
 	if closer, ok := repBody.(io.Closer); ok {
 		defer closer.Close()
 	}
@@ -194,6 +211,7 @@ func (client *Client) toMap(repBody io.Reader) (rep map[string]string, err error
 	if err != nil {
 		return nil, err
 	}
+	fmt.Printf("toMap rep: %v\n", rep)
 
 	returnCode := rep["return_code"]
 	if returnCode != ReturnCodeSuccess {
@@ -203,12 +221,24 @@ func (client *Client) toMap(repBody io.Reader) (rep map[string]string, err error
 		}
 	}
 
+	resultCode := rep["result_code"]
+	if resultCode != ResultCodeSuccess {
+		return nil, &BizError{
+			ResultCode:  resultCode,
+			ErrCode:     rep["err_code"],
+			ErrCodeDesc: rep["err_code_des"],
+		}
+	}
+
 	appId := rep["appid"]
-	if appId != client.appID {
+	if appId != "" && appId != client.appID {
 		return nil, fmt.Errorf("appid mismatch, have: %s, want: %s", appId, client.appID)
 	}
 	mchId := rep["mch_id"]
-	if mchId != client.mchID {
+	if mchId == "" {
+		mchId, _ = rep["mchid"]
+	}
+	if mchId != "" && mchId != client.mchID {
 		return nil, fmt.Errorf("mch_id mismatch, have: %s, want: %s", mchId, client.mchID)
 	}
 
@@ -221,6 +251,10 @@ func (client *Client) toMap(repBody io.Reader) (rep map[string]string, err error
 		if subMchId != client.subMchID {
 			return nil, fmt.Errorf("sub_mch_id mismatch, have: %s, want: %s", subMchId, client.subMchID)
 		}
+	}
+
+	if isEnterprisePay { // enterprise payment response has no sign
+		return rep, nil
 	}
 
 	var signWant string
@@ -239,14 +273,6 @@ func (client *Client) toMap(repBody io.Reader) (rep map[string]string, err error
 		return nil, fmt.Errorf("sign mismatch,\nhave: %s,\nwant: %s", signHave, signWant)
 	}
 
-	resultCode := rep["result_code"]
-	if resultCode != ResultCodeSuccess {
-		return nil, &BizError{
-			ResultCode:  resultCode,
-			ErrCode:     rep["err_code"],
-			ErrCodeDesc: rep["err_code_des"],
-		}
-	}
 	return rep, nil
 }
 

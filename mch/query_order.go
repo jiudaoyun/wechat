@@ -45,17 +45,24 @@ func getOrderInfo(req map[string]string) (*OrderInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	settlementTotalFee, err := strconv.Atoi(req["settlement_total_fee"])
-	if err != nil {
-		return nil, err
+	var settlementTotalFee, couponFee, couponCount int
+	if req["settlement_total_fee"] != "" {
+		settlementTotalFee, err = strconv.Atoi(req["settlement_total_fee"])
+		if err != nil {
+			return nil, err
+		}
 	}
-	couponFee, err := strconv.Atoi(req["coupon_fee"])
-	if err != nil {
-		return nil, err
+	if req["coupon_fee"] != "" {
+		couponFee, err = strconv.Atoi(req["coupon_fee"])
+		if err != nil {
+			return nil, err
+		}
 	}
-	couponCount, err := strconv.Atoi(req["coupon_count"])
-	if err != nil {
-		return nil, err
+	if req["coupon_count"] != "" {
+		couponCount, err = strconv.Atoi(req["coupon_count"])
+		if err != nil {
+			return nil, err
+		}
 	}
 	timeEnd, err := ParseTime(req["time_end"])
 	if err != nil {
@@ -103,6 +110,11 @@ func (client *Client) QueryOrder(req *QueryOrderRequest) (rep *QueryOrderRespons
 	}
 
 	repMap, err := client.PostXML("/pay/orderquery", reqMap)
+	if err != nil {
+		client.Errorf("QueryOrder error: %s", err)
+		return nil, err
+	}
+	client.Infof("QueryOrder response map: %s", repMap)
 
 	tradeState := TradeState(repMap["trade_state"])
 	if tradeState != TradeStateSUCCESS {
@@ -117,7 +129,7 @@ func (client *Client) QueryOrder(req *QueryOrderRequest) (rep *QueryOrderRespons
 		return rep, nil
 	}
 
-	orderInfo, err := getOrderInfo(reqMap)
+	orderInfo, err := getOrderInfo(repMap)
 	if err != nil {
 		return nil, err
 	}
